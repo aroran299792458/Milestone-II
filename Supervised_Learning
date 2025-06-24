@@ -1,0 +1,170 @@
+import pandas as pd
+import numpy as np
+import gc
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, roc_curve
+import xgboost as xgb
+from imblearn.over_sampling import SMOTE
+from sklearn.impute import SimpleImputer
+import uuid
+
+# Define dtypes for relevant columns to avoid mixed-type warnings
+dtypes = {
+    'ORIGIN_AIRPORT_ID': 'int32', 'DEST_AIRPORT_ID': 'int32', 'DAY_OF_WEEK': 'int8',
+    'DEP_TIME': 'object', 'CRS_DEP_TIME': 'object', 'WEATHER_DELAY': 'float32',
+    'TAXI_OUT': 'float32', 'TAXI_IN': 'float32', 'latitude': 'float32', 'longitude': 'float32',
+    'wnd': 'object', 'vis': 'object', 'tmp': 'object', 'dew': 'object', 'aa1': 'object'
+}
+
+# Load the entire dataset with specified column types and relevant columns
+relevant_cols = ['ORIGIN_AIRPORT_ID', 'DEST_AIRPORT_ID', 'DAY_OF_WEEK', 'DEP_TIME', 'CRS_DEP_TIME',
+                 'WEATHER_DELAY', 'TAXI_OUT', 'TAXI_IN', 'latitude', 'longitude', 'wnd', 'vis', 'tmp', 'dew', 'aa1']
+df = pd.read_csv('/content/merged_data.csv', usecols=relevant_cols, dtype=dtypes)
+
+# Parse weather features with clipping to prevent overflow
+def estimate_humidity(temp, dewp):
+    temp, dewp = np.clip(temp, -50, 50), np.clip(dewp, -50, 50)  # Clip to reasonable range
+    return np.clip(100 * (np.exp((17.625 * dewp) / (243.04 + dewp)) / np.exp((17.625 * temp) / (243.04 + temp))), 0, 100)
+
+def parse_wind(wnd_str):
+    return float(wnd_str.split(',')[1].strip()) if isinstance(wnd_str, str) and len(wnd_str.split(',')) >= 2 else np.nan
+
+def parse_visibility(vis_str):
+    return 10000.0 if isinstance(vis_str, str) and vis_str.split(',')[0].strip() == '9999' else float(vis_str.split(',')[0].strip()) if isinstance(vis_str, str) else np.nan
+
+def parse_temperature(tmp_str):
+    return float(tmp_str.split(',')[0].replace('+', '')) / 10.0 if isinstance(tmp_str, str) else np.nan
+
+def parse_dewpoint(dew_str):
+    return float(dew_str.split(',')[0].replace('+', '')) / 10.0 if isinstance(dew_str, str) else np.nan
+
+def parse_precipitation(aa1_str):
+    return float(aa1_str.split(',')[1].strip()) if isinstance(aa1_str, str) and len(aa1_str.split(',')) > 1 else 0.0
+
+# Apply parsing with float32 to avoid overflow
+df['WindSpeed'] = df['wnd'].apply(parse_wind).astype('float32').clip(0, 100)
+df['vis'] = df['vis'].apply(parse_visibility).astype('float32').clip(0, 10000)
+df['Temperature'] = df['tmp'].apply(parse_temperature).astype('float32').clip(-50, 50)
+df['DewPoint'] = df['dew'].apply(parse_dewpoint).astype('float32').clip(-50, 50)
+df['Precipitation'] = df['aa1'].apply(parse_precipitation).astype('float32').clip(0, 100)
+df['Humidity'] = np.where((df['Temperature'].notna()) & (df['DewPoint'].notna()),
+                          estimate_humidity(df['Temperature'], df['DewPoint']), 50.0).astype('float32').clip(0, 100)
+
+# Feature engineering
+dep_hour = pd.to_datetime(df['DEP_TIME'], errors='coerce').dt.hour.fillna(
+    pd.to_datetime(df['CRS_DEP_TIME'], errors='coerce').dt.hour).fillna(12).astype('int8')
+df['HourSin'] = np.sin(2 * np.pi * dep_hour / 24).astype('float32')
+df['HourCos'] = np.cos(2 * np.pi * dep_hour / 24).astype('float32')
+df['OriginDest'] = df['ORIGIN_AIRPORT_ID'].astype(str) + '-' + df['DEST_AIRPORT_ID'].astype(str)
+df['Delayed'] = (df['WEATHER_DELAY'] > 60).astype('int8')
+
+# Select features
+columns_to_keep = ['WindSpeed', 'vis', 'Temperature', 'DewPoint', 'Precipitation', 'Humidity', 'TAXI_OUT', 'TAXI_IN',
+                   'latitude', 'longitude', 'DAY_OF_WEEK', 'ORIGIN_AIRPORT_ID', 'DEST_AIRPORT_ID', 'OriginDest', 'Delayed']
+df = df[columns_to_keep].copy()
+
+# Handle missing values
+numeric_cols = ['WindSpeed', 'vis', 'Temperature', 'DewPoint', 'Precipitation', 'Humidity', 'TAXI_OUT', 'TAXI_IN', 'latitude', 'longitude']
+categorical_cols = ['DAY_OF_WEEK', 'ORIGIN_AIRPORT_ID', 'DEST_AIRPORT_ID']
+df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median()).astype('float32')
+df[categorical_cols] = df[categorical_cols].fillna(df[categorical_cols].mode().iloc[0]).astype('int16')
+
+# Features and target
+features = ['OriginDest', 'DAY_OF_WEEK', 'ORIGIN_AIRPORT_ID'] + numeric_cols
+X = df[features]
+y = df['Delayed']
+
+# Preprocessing with sparse one-hot encoding
+numeric_transformer = Pipeline(steps=[('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())])
+categorical_transformer = Pipeline(steps=[('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+                                          ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=True))])
+preprocessor = ColumnTransformer(transformers=[
+    ('num', numeric_transformer, numeric_cols),
+    ('cat', categorical_transformer, ['OriginDest', 'DAY_OF_WEEK', 'ORIGIN_AIRPORT_ID'])
+], sparse_threshold=0.3)
+
+# Split data
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, stratify=y, random_state=42)
+
+# Apply SMOTE with conservative oversampling
+smote = SMOTE(sampling_strategy=0.3, random_state=42, k_neighbors=3)
+X_train_res, y_train_res = smote.fit_resample(preprocessor.fit_transform(X_train).toarray(), y_train)  # Convert sparse to dense for SMOTE
+X_test_transformed = preprocessor.transform(X_test).toarray()
+
+# Define models with class weights
+models = {
+    'Logistic Regression': (LogisticRegression(max_iter=500, class_weight='balanced', random_state=42), {'classifier__C': [0.1, 1.0]}),
+    'Random Forest': (RandomForestClassifier(class_weight='balanced', random_state=42), {'classifier__max_depth': [10], 'classifier__n_estimators': [50]}),
+    'XGBoost': (xgb.XGBClassifier(scale_pos_weight=(y_train==0).sum()/(y_train==1).sum(), random_state=42), {'classifier__max_depth': [6], 'classifier__learning_rate': [0.1], 'classifier__n_estimators': [50]})
+}
+
+# Store results
+model_results = {}
+
+# Train and visualize
+for name, (model, param_grid) in models.items():
+    try:
+        pipeline = Pipeline(steps=[('preprocessor', preprocessor), ('classifier', model)])
+        grid_search = GridSearchCV(pipeline, param_grid, cv=3, scoring='roc_auc', n_jobs=1, error_score='raise')
+        grid_search.fit(X_train, y_train)
+        best_model = grid_search.best_estimator_
+        y_pred = best_model.predict(X_test)
+        y_proba = best_model.predict_proba(X_test)[:, 1]
+
+        # Metrics
+        accuracy = accuracy_score(y_test, y_pred)
+        roc_auc = roc_auc_score(y_test, y_proba)
+        precision = precision_score(y_test, y_pred, zero_division=0)
+        recall = recall_score(y_test, y_pred, zero_division=0)
+        model_results[name] = {'Accuracy': accuracy, 'ROC-AUC': roc_auc, 'Precision': precision, 'Recall': recall}
+
+        print(f"\n{name} Results (Best Params: {grid_search.best_params_}):")
+        for metric, value in model_results[name].items():
+            print(f"{metric}: {value:.4f}")
+
+        # Visualization 1: Correlation Matrix
+        plt.figure(figsize=(8, 6))
+        corr = df[numeric_cols].corr()
+        sns.heatmap(corr, annot=True, cmap='coolwarm', fmt='.2f')
+        plt.title(f'Correlation Matrix - {name}')
+        plt.tight_layout()
+        plt.savefig(f'corr_matrix_{name.lower().replace(" ", "_")}_{uuid.uuid4()}.png')
+        plt.close()
+
+        # Visualization 2: ROC-AUC Curve
+        fpr, tpr, _ = roc_curve(y_test, y_proba)
+        plt.figure(figsize=(6, 6))
+        plt.plot(fpr, tpr, label=f'ROC curve (AUC = {roc_auc:.2f})')
+        plt.plot([0, 1], [0, 1], 'k--')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(f'ROC-AUC Curve - {name}')
+        plt.legend(loc='best')
+        plt.tight_layout()
+        plt.savefig(f'roc_auc_{name.lower().replace(" ", "_")}_{uuid.uuid4()}.png')
+        plt.close()
+
+        # Visualization 3: Boxplots for Numeric Features
+        plt.figure(figsize=(10, 6))
+        df[numeric_cols].boxplot()
+        plt.xticks(rotation=45)
+        plt.title(f'Boxplots of Numeric Features - {name}')
+        plt.tight_layout()
+        plt.savefig(f'boxplot_{name.lower().replace(" ", "_")}_{uuid.uuid4()}.png')
+        plt.close()
+
+    except Exception as e:
+        print(f"Error training {name}: {str(e)}")
+    finally:
+        gc.collect()
+        plt.close('all')
+
+print("\nFinal Model Results Dictionary:")
+print(model_results)
